@@ -199,6 +199,20 @@ export default function TechnicalInterviewSimulator() {
   const [questions, setQuestions] = useState<Question[]>([])
   const [currentQuestion, setCurrentQuestion] = useState(0)
   const [timer, setTimer] = useState(60)
+  
+  // Function to get timer duration based on question type
+  const getTimerDuration = (questionType: string) => {
+    switch (questionType) {
+      case 'mcq':
+        return 90  // 1.5 minutes for MCQ
+      case 'short_answer':
+        return 180 // 3 minutes for short answers
+      case 'long_answer':
+        return 300 // 5 minutes for long answers
+      default:
+        return 60  // fallback
+    }
+  }
   const [isTimerRunning, setIsTimerRunning] = useState(false)
   const [userAnswers, setUserAnswers] = useState<UserAnswer[]>([])
   const [currentAnswer, setCurrentAnswer] = useState("")
@@ -316,12 +330,24 @@ export default function TechnicalInterviewSimulator() {
           if (!res.ok) throw new Error('Failed to generate questions from resume');
           const data = await res.json();
           if (Array.isArray(data) && data.length > 0) {
-            setQuestions(data.map(mapApiQuestionToFrontend));
+            const mappedQuestions = data.map(mapApiQuestionToFrontend);
+            setQuestions(mappedQuestions);
+            // Auto-set tech stack for Pro users from the first question
+            if (data[0]?.tech_stack) {
+              setTechStack(data[0].tech_stack);
+            }
+            // Optional: Auto-start interview for Pro users (can be commented out if not desired)
+            // setTimeout(() => {
+            //   if (mappedQuestions.length > 0) {
+            //     startInterview();
+            //   }
+            // }, 1000);
           } else {
             setQuestions([]);
           }
         } catch (err) {
-          setFetchError('Could not load questions from server.');
+          console.error('Error loading Pro questions:', err);
+          setFetchError('Failed to generate personalized questions. Please check your internet connection and try uploading your resume again.');
           setQuestions([]);
         } finally {
           setIsLoadingQuestions(false);
@@ -331,12 +357,60 @@ export default function TechnicalInterviewSimulator() {
     }
   }, [isPro, resumeText]);
 
+  // Helper: Sanitize text to remove problematic Unicode sequences
+  const sanitizeText = (text: string): string => {
+    if (!text) return '';
+    
+    // Remove null characters and other problematic control characters
+    let sanitized = text.replace(/\x00/g, '');
+    
+    // Remove or replace problematic Unicode escape sequences
+    sanitized = sanitized.replace(/\\u[0-9a-fA-F]{4}/g, (match) => {
+      try {
+        return String.fromCharCode(parseInt(match.slice(2), 16));
+      } catch (e) {
+        return ''; // Remove invalid sequences
+      }
+    });
+    
+    // Remove other escape sequences that might cause issues
+    sanitized = sanitized.replace(/\\[nrtbfav]/g, ' ');
+    
+    // Replace multiple whitespace with single space
+    sanitized = sanitized.replace(/\s+/g, ' ');
+    
+    // Remove any remaining problematic characters
+    sanitized = sanitized.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
+    
+    // Remove problematic quotes that might break JSON
+    sanitized = sanitized.replace(/[\u2018\u2019]/g, "'"); // Smart single quotes
+    sanitized = sanitized.replace(/[\u201C\u201D]/g, '"'); // Smart double quotes
+    sanitized = sanitized.replace(/[\u2013\u2014]/g, '-'); // En/em dashes
+    
+    return sanitized.trim();
+  };
+
+  // Helper: Safe JSON stringify with error handling
+  const safeJSONStringify = (obj: any): string => {
+    try {
+      return JSON.stringify(obj);
+    } catch (error) {
+      console.error('JSON stringify error:', error);
+      // Create a safer version of the object
+      const safeObj = { ...obj };
+      if (safeObj.extractedText) {
+        safeObj.extractedText = sanitizeText(safeObj.extractedText);
+      }
+      return JSON.stringify(safeObj);
+    }
+  };
+
   // Helper: Extract text from PDF
   const extractTextFromPDF = async (file: File): Promise<string> => {
     // Dynamically import pdfjs-dist only in the browser
     // @ts-ignore
-    const pdfjsLib = await import("pdfjs-dist/build/pdf");
-    pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.js";
+    const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.min.mjs");
+    pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
     const arrayBuffer = await file.arrayBuffer();
     const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
     let text = "";
@@ -345,14 +419,14 @@ export default function TechnicalInterviewSimulator() {
       const content = await page.getTextContent();
       text += content.items.map((item: any) => item.str).join(" ") + "\n";
     }
-    return text;
+    return sanitizeText(text);
   };
 
   // Helper: Extract text from DOCX
   const extractTextFromDOCX = async (file: File): Promise<string> => {
     const arrayBuffer = await file.arrayBuffer();
     const { value } = await mammoth.extractRawText({ arrayBuffer });
-    return value;
+    return sanitizeText(value);
   };
 
   // Helper: Extract text from DOC (best effort, limited support)
@@ -366,10 +440,21 @@ export default function TechnicalInterviewSimulator() {
 
   // Helper: Cache resume text in localStorage
   const cacheResumeText = (fileName: string, text: string) => {
-    localStorage.setItem(`resumeText:${fileName}`, text);
+    try {
+      const sanitizedText = sanitizeText(text);
+      localStorage.setItem(`resumeText:${fileName}`, sanitizedText);
+    } catch (error) {
+      console.error('Failed to cache resume text:', error);
+    }
   };
+  
   const getCachedResumeText = (fileName: string) => {
-    return localStorage.getItem(`resumeText:${fileName}`) || '';
+    try {
+      return localStorage.getItem(`resumeText:${fileName}`) || '';
+    } catch (error) {
+      console.error('Failed to retrieve cached resume text:', error);
+      return '';
+    }
   };
 
   // Modified handler for resume upload
@@ -405,19 +490,45 @@ export default function TechnicalInterviewSimulator() {
         cacheResumeText(file.name, text);
         // Export as JSON and send to backend resumes table
         try {
+          // Validate text length and content
+          if (text.length === 0) {
+            setFetchError('No text content found in the uploaded file');
+            return;
+          }
+          
+          if (text.length > 100000) {
+            setFetchError('Resume text is too long. Please use a shorter document.');
+            return;
+          }
+          
           // You may want to generate or retrieve a sessionId/userId here
           const sessionId = undefined; // Set if available
           const userId = undefined; // Set if available
+          
+          console.log('📤 Saving resume:', {
+            fileName: file.name,
+            textLength: text.length,
+            preview: text.substring(0, 100) + '...'
+          });
+          
           const response = await fetch('/api/responses/resume', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ fileName: file.name, extractedText: text, sessionId, userId })
+            body: safeJSONStringify({ fileName: file.name, extractedText: text, sessionId, userId })
           });
+          
           if (!response.ok) {
             const errJson = await response.json();
+            console.error('Resume save error:', errJson);
             setFetchError('Failed to save resume: ' + (errJson?.error || response.statusText));
+          } else {
+            const result = await response.json();
+            console.log('✅ Resume saved successfully:', result);
+            // Optional: Show success message
+            // setFetchError('Resume saved successfully!');
           }
         } catch (err: any) {
+          console.error('Resume save exception:', err);
           setFetchError('Failed to save resume: ' + (err?.message || String(err)));
         }
       } else {
@@ -430,7 +541,7 @@ export default function TechnicalInterviewSimulator() {
   const startInterview = () => {
     if (questions.length > 0) {
       setIsInterviewStarted(true)
-      setTimer(60)
+      setTimer(getTimerDuration(questions[0].type))
       setIsTimerRunning(true)
       setCurrentAnswer("")
     }
@@ -439,12 +550,13 @@ export default function TechnicalInterviewSimulator() {
   const handleNextQuestion = useCallback(() => {
     // Save current answer
     if (currentAnswer.trim()) {
+      const currentQuestionTimer = getTimerDuration(questions[currentQuestion].type)
       const newAnswer: UserAnswer = {
         questionId: questions[currentQuestion].id,
         questionText: questions[currentQuestion].question,
         questionType: questions[currentQuestion].type,
         answer: currentAnswer,
-        timeSpent: 60 - timer,
+        timeSpent: currentQuestionTimer - timer,
       }
       setUserAnswers((prev) => [...prev, newAnswer])
     }
@@ -453,7 +565,7 @@ export default function TechnicalInterviewSimulator() {
     if (currentQuestion < questions.length - 1) {
       setCurrentQuestion((prev) => prev + 1)
       setCurrentAnswer("")
-      setTimer(60)
+      setTimer(getTimerDuration(questions[currentQuestion + 1].type))
     } else {
       setIsTimerRunning(false)
       setShowResults(true)
@@ -469,28 +581,62 @@ export default function TechnicalInterviewSimulator() {
     try {
       const sessionId = `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
       
+      const requestData = {
+        sessionId,
+        techStack,
+        responses: userAnswers,
+        resumeText: resumeText ? sanitizeText(resumeText) : null,
+        isPro,
+        evaluateWithMistral: isPro // Only Pro users get Mistral evaluation
+      };
+      
+      console.log('🚀 Submitting responses to API:', requestData);
+      
+      let requestBody;
+      try {
+        requestBody = safeJSONStringify(requestData);
+        console.log('✅ JSON stringified successfully');
+      } catch (stringifyError) {
+        console.error('❌ JSON stringify error:', stringifyError);
+        throw new Error('Failed to serialize request data');
+      }
+      
       const response = await fetch('/api/responses', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          sessionId,
-          techStack,
-          responses: userAnswers,
-          resumeText: resumeText || null,
-          isPro,
-          evaluateWithMistral: isPro // Only Pro users get Mistral evaluation
-        })
+        body: requestBody
       });
 
+      console.log('📡 API Response status:', response.status);
+      
       if (!response.ok) {
-        throw new Error('Failed to submit responses');
+        let errorData;
+        try {
+          errorData = await response.json();
+        } catch (parseError) {
+          // If response is not JSON, try to get text
+          try {
+            const errorText = await response.text();
+            errorData = { error: errorText };
+          } catch (textError) {
+            errorData = { error: 'Unknown error occurred' };
+          }
+        }
+        console.error('❌ API Error:', errorData);
+        throw new Error(`Failed to submit responses: ${response.status}`);
       }
 
       const result = await response.json();
+      console.log('✅ API Result:', result);
+      
       if (result.evaluation) {
+        console.log('🎯 Setting evaluation result:', result.evaluation);
+        console.log('🔍 Evaluation structure:', JSON.stringify(result.evaluation, null, 2));
         setEvaluationResult(result.evaluation);
+      } else {
+        console.log('⚠️ No evaluation in result - will use mock data');
       }
       
       if (result.warning) {
@@ -509,7 +655,7 @@ export default function TechnicalInterviewSimulator() {
     setCurrentQuestion(0)
     setUserAnswers([])
     setCurrentAnswer("")
-    setTimer(60)
+    setTimer(questions.length > 0 ? getTimerDuration(questions[0].type) : 60)
     setIsTimerRunning(false)
     setShowResults(false)
     setIsInterviewStarted(false)
@@ -549,7 +695,8 @@ export default function TechnicalInterviewSimulator() {
   };
 
   const currentQ = questions[currentQuestion]
-  const progressPercentage = ((60 - timer) / 60) * 100
+  const currentQuestionTimer = questions.length > 0 ? getTimerDuration(questions[currentQuestion]?.type || 'mcq') : 60
+  const progressPercentage = ((currentQuestionTimer - timer) / currentQuestionTimer) * 100
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100 dark:from-slate-900 dark:to-slate-800">
@@ -601,106 +748,19 @@ export default function TechnicalInterviewSimulator() {
                       <SelectValue placeholder="Choose technology..." />
                     </SelectTrigger>
                     <SelectContent>
-                      {techStacks.map((tech) => (
-                        <SelectItem key={tech.value} value={tech.value}>
-                          <div className="flex items-center gap-2">
-                            <span>{tech.icon}</span>
-                            {tech.label}
-                          </div>
+                      {techStacks.map((stack) => (
+                        <SelectItem key={stack.value} value={stack.value}>
+                          {stack.label}
                         </SelectItem>
                       ))}
                     </SelectContent>
                   </Select>
-                  {isLoadingQuestions && (
-                    <div className="text-blue-600 text-sm mt-2">Loading questions...</div>
-                  )}
-                  {fetchError && (
-                    <div className="text-red-600 text-xs mt-1">{fetchError}</div>
-                  )}
+                  <p className="text-xs text-slate-500">Pro users can select from premium voices</p>
                 </CardContent>
               </Card>
             )}
-
-            {/* Voice Assistant */}
+            {/* Resume Analysis - Pro Only */}
             <Card>
-              <CardHeader>
-                <CardTitle className="text-lg flex items-center gap-2">
-                  Voice Assistant
-                  {!isPro && (
-                    <Badge variant="secondary" className="ml-2">
-                      Basic
-                    </Badge>
-                  )}
-                  {isPro && (
-                    <Badge variant="default" className="ml-2 bg-gradient-to-r from-purple-600 to-blue-600">
-                      Pro
-                    </Badge>
-                  )}
-                </CardTitle>
-                <CardDescription>
-                  {isPro
-                    ? "Choose your preferred voice for question reading"
-                    : "Basic voice reading available - upgrade for voice selection"}
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                {isPro ? (
-                  <div className="space-y-4">
-                    <Select
-                      value={selectedVoice?.name || ""}
-                      onValueChange={(value) => {
-                        const voice = availableVoices.find((v) => v.name === value)
-                        setSelectedVoice(voice || null)
-                      }}
-                    >
-                      <SelectTrigger>
-                        <SelectValue placeholder="Select voice..." />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {availableVoices.map((voice) => (
-                          <SelectItem key={voice.name} value={voice.name}>
-                            <div className="flex items-center gap-2">
-                              <span className="text-xs bg-slate-100 dark:bg-slate-800 px-2 py-1 rounded">
-                                {voice.lang}
-                              </span>
-                              {voice.name.replace(/Microsoft|Google|Apple/g, "").trim()}
-                            </div>
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                    <p className="text-xs text-slate-500">Pro users can select from premium voices</p>
-                  </div>
-                ) : (
-                  <div className="space-y-4">
-                    <div className="flex items-center gap-3 p-3 bg-slate-50 dark:bg-slate-800 rounded-lg">
-                      <Volume2 className="w-5 h-5 text-blue-600" />
-                      <div className="flex-1">
-                        <p className="text-sm font-medium">Basic Voice Available</p>
-                        <p className="text-xs text-slate-500">
-                          Questions will be read using your system's default voice
-                        </p>
-                      </div>
-                    </div>
-                    <div className="text-center py-4 border-t border-slate-200 dark:border-slate-700">
-                      <Lock className="w-6 h-6 text-slate-300 mx-auto mb-2" />
-                      <p className="text-sm text-slate-500 mb-3">Voice selection is a Pro feature</p>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() => setIsPro(true)}
-                        className="border-purple-200 text-purple-700 hover:bg-purple-50"
-                      >
-                        Upgrade for Voice Selection
-                      </Button>
-                    </div>
-                  </div>
-                )}
-              </CardContent>
-            </Card>
-
-            {/* Resume Upload */}
-            <Card className={cn(!isPro && "opacity-60")}>
               <CardHeader>
                 <CardTitle className="text-lg flex items-center gap-2">
                   Resume Analysis
@@ -741,11 +801,22 @@ export default function TechnicalInterviewSimulator() {
                         </div>
                       </div>
                     )}
+                    {isLoadingQuestions && (
+                      <div className="flex items-center gap-2 p-3 bg-blue-50 dark:bg-blue-900/20 rounded">
+                        <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-blue-600"></div>
+                        <span className="text-sm text-blue-700 dark:text-blue-400">Generating personalized questions based on your resume...</span>
+                      </div>
+                    )}
+                    {fetchError && (
+                      <div className="text-red-600 text-xs mt-2 p-2 bg-red-50 dark:bg-red-900/20 rounded">{fetchError}</div>
+                    )}
                   </div>
                 ) : (
                   <div className="text-center py-8">
                     <Lock className="w-12 h-12 text-slate-300 mx-auto mb-3" />
-                    <p className="text-sm text-slate-500 mb-3">Resume analysis is a Pro feature</p>
+                    <p className="text-sm text-slate-500 mb-3">
+                      Resume analysis is a Pro feature
+                    </p>
                     <Button
                       variant="outline"
                       size="sm"
@@ -760,40 +831,49 @@ export default function TechnicalInterviewSimulator() {
             </Card>
 
             {/* Interview Stats */}
-            {techStack && (
+            {(techStack || (isPro && isLoadingQuestions)) && (
               <Card>
                 <CardHeader>
                   <CardTitle className="text-lg">Interview Details</CardTitle>
                 </CardHeader>
                 <CardContent className="space-y-3">
-                  <div className="flex justify-between">
-                    <span className="text-sm text-slate-600 dark:text-slate-400">Questions:</span>
-                    <span className="text-sm font-medium">{questions.length}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-sm text-slate-600 dark:text-slate-400">Time per question:</span>
-                    <span className="text-sm font-medium">60 seconds</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-sm text-slate-600 dark:text-slate-400">Difficulty:</span>
-                    <div className="flex gap-1">
-                      {questions.map((q) => (
-                        <Badge
-                          key={q.id}
-                          variant={
-                            q.difficulty === "easy"
-                              ? "secondary"
-                              : q.difficulty === "medium"
-                                ? "default"
-                                : "destructive"
-                          }
-                          className="text-xs"
-                        >
-                          {q.difficulty}
-                        </Badge>
-                      ))}
+                  {isLoadingQuestions && isPro ? (
+                    <div className="flex items-center gap-2">
+                      <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-blue-600"></div>
+                      <span className="text-sm text-slate-600 dark:text-slate-400">Preparing interview questions...</span>
                     </div>
-                  </div>
+                  ) : (
+                    <>
+                      <div className="flex justify-between items-center">
+                        <span className="text-sm text-slate-600 dark:text-slate-400">Questions:</span>
+                        <span className="text-sm font-medium">{questions.length}</span>
+                      </div>
+                      <div className="flex justify-between items-center">
+                        <span className="text-sm text-slate-600 dark:text-slate-400">Time per question:</span>
+                        <span className="text-sm font-medium">60 seconds</span>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-x-2">
+                        <span className="text-sm text-slate-600 dark:text-slate-400">Difficulty:</span>
+                        <div className="flex flex-wrap gap-1 flex-1 min-w-0">
+                          {questions.map((q) => (
+                            <Badge
+                              key={q.id}
+                              variant={
+                                q.difficulty === "easy"
+                                  ? "secondary"
+                                  : q.difficulty === "medium"
+                                    ? "default"
+                                    : "destructive"
+                              }
+                              className="text-xs"
+                            >
+                              {q.difficulty}
+                            </Badge>
+                          ))}
+                        </div>
+                      </div>
+                    </>
+                  )}
                 </CardContent>
               </Card>
             )}
@@ -806,21 +886,33 @@ export default function TechnicalInterviewSimulator() {
               <Card className="h-full">
                 <CardContent className="flex flex-col items-center justify-center h-96 text-center">
                   <div className="w-20 h-20 bg-gradient-to-r from-blue-600 to-purple-600 rounded-full flex items-center justify-center mb-6">
-                    <Play className="w-10 h-10 text-white" />
+                    {isLoadingQuestions && isPro ? (
+                      <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-white"></div>
+                    ) : (
+                      <Play className="w-10 h-10 text-white" />
+                    )}
                   </div>
-                  <h2 className="text-2xl font-bold mb-4">Ready to Start?</h2>
+                  <h2 className="text-2xl font-bold mb-4">
+                    {isLoadingQuestions && isPro ? "Generating Questions..." : "Ready to Start?"}
+                  </h2>
                   <p className="text-slate-600 dark:text-slate-400 mb-6 max-w-md">
-                    {techStack
-                      ? `You'll answer ${questions.length} ${techStack} questions. Each question has a 60-second timer.`
+                    {isLoadingQuestions && isPro 
+                      ? "AI is analyzing your resume and creating personalized interview questions. This may take a moment..."
+                      : isPro && questions.length > 0
+                      ? `You'll answer ${questions.length} personalized questions based on your resume. MCQ questions (1.5 min), short answers (3 min), and long answers (5 min).`
+                      : techStack
+                      ? `You'll answer ${questions.length} ${techStack} questions. MCQ questions (1.5 min), short answers (3 min), and long answers (5 min).`
+                      : isPro 
+                      ? "Upload your resume to generate personalized interview questions."
                       : "Select a technology stack to begin your interview simulation."}
                   </p>
                   <Button
                     onClick={startInterview}
-                    disabled={!techStack || questions.length === 0}
+                    disabled={isPro ? (questions.length === 0 || isLoadingQuestions) : (!techStack || questions.length === 0)}
                     size="lg"
                     className="bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700"
                   >
-                    Start Interview
+                    {isLoadingQuestions && isPro ? "Generating Questions..." : "Start Interview"}
                   </Button>
                 </CardContent>
               </Card>
@@ -842,14 +934,14 @@ export default function TechnicalInterviewSimulator() {
                         </>
                       )}
                     </CardTitle>
-                                          <CardDescription>
-                        {isPro && evaluationResult 
-                          ? "AI-powered evaluation complete" 
-                          : isPro && isSubmittingResponses 
-                            ? "AI is analyzing your responses..." 
-                            : "Here's your performance summary"
-                        }
-                      </CardDescription>
+                    <CardDescription>
+                      {isPro && evaluationResult 
+                        ? "AI-powered answer corrections and explanations" 
+                        : isPro && isSubmittingResponses 
+                          ? "AI is analyzing your responses..." 
+                          : "Here's your performance summary"
+                      }
+                    </CardDescription>
                   </CardHeader>
                   <CardContent className="space-y-6">
                     <div className="text-center">
@@ -860,91 +952,284 @@ export default function TechnicalInterviewSimulator() {
                         </div>
                       ) : evaluationResult ? (
                         <div>
-                          <div className="text-4xl font-bold text-green-600 mb-2">
-                            {evaluationResult.overallScore || mockFeedback.score}%
+                          <div className="text-2xl font-bold text-blue-600 mb-2">
+                            ✓ Correct Answers Available
                           </div>
                           <div className="flex items-center justify-center gap-2 mt-2">
                             <Badge variant="default" className="bg-gradient-to-r from-purple-600 to-blue-600">
                               <Crown className="w-3 h-3 mr-1" />
-                              AI Evaluation
+                              AI Corrections
                             </Badge>
                           </div>
                           <p className="text-slate-600 dark:text-slate-400 mt-2">
-                            AI-powered evaluation complete
+                            AI-powered answer corrections complete
                           </p>
                         </div>
                       ) : (
                         <div>
-                          <div className="text-4xl font-bold text-green-600 mb-2">{mockFeedback.score}%</div>
+                          <div className="text-4xl font-bold text-green-600 mb-2">
+                            {evaluationResult?.evaluation?.overallScore || mockFeedback.score}%
+                          </div>
                           <p className="text-slate-600 dark:text-slate-400">
-                            {userAnswers.length} of {mockFeedback.totalQuestions} questions answered
+                            {userAnswers.length} of {evaluationResult?.evaluation?.totalQuestions || mockFeedback.totalQuestions} questions answered
                           </p>
+                          {evaluationResult?.evaluation?.passFailStatus && (
+                            <div className={`mt-2 px-3 py-1 rounded-full text-sm font-medium inline-block ${
+                              evaluationResult.evaluation.passFailStatus === 'PASS' 
+                                ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400' 
+                                : 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400'
+                            }`}>
+                              {evaluationResult.evaluation.passFailStatus}
+                            </div>
+                          )}
                         </div>
                       )}
                     </div>
 
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                      <div>
-                        <h4 className="font-semibold text-green-700 dark:text-green-400 mb-2">
-                          {evaluationResult ? 'AI-Identified Strengths' : 'Strengths'}
-                        </h4>
-                        <ul className="space-y-1">
-                          {(evaluationResult?.strengths || mockFeedback.strengths).map((strength: string, index: number) => (
-                            <li
-                              key={index}
-                              className="text-sm text-slate-600 dark:text-slate-400 flex items-start gap-2"
-                            >
-                              <CheckCircle className="w-4 h-4 text-green-500 mt-0.5 flex-shrink-0" />
-                              {strength}
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
-                      <div>
-                        <h4 className="font-semibold text-orange-700 dark:text-orange-400 mb-2">
-                          {evaluationResult ? 'AI-Identified Areas for Improvement' : 'Areas for Improvement'}
-                        </h4>
-                        <ul className="space-y-1">
-                          {(evaluationResult?.improvements || mockFeedback.improvements).map((improvement: string, index: number) => (
-                            <li
-                              key={index}
-                              className="text-sm text-slate-600 dark:text-slate-400 flex items-start gap-2"
-                            >
-                              <XCircle className="w-4 h-4 text-orange-500 mt-0.5 flex-shrink-0" />
-                              {improvement}
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
-                    </div>
+                    {/* Display evaluation results */}
+                    {evaluationResult?.evaluation ? (
+                      <div className="space-y-6 mt-6">
+                        {/* Detailed Scores */}
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                          <div className="p-4 bg-blue-50 dark:bg-blue-900/20 rounded-lg">
+                            <h4 className="font-semibold text-blue-700 dark:text-blue-400 mb-2">MCQ Score</h4>
+                            <div className="text-2xl font-bold text-blue-600">{evaluationResult.evaluation.mcqScore}%</div>
+                          </div>
+                          <div className="p-4 bg-purple-50 dark:bg-purple-900/20 rounded-lg">
+                            <h4 className="font-semibold text-purple-700 dark:text-purple-400 mb-2">Written Answers</h4>
+                            <div className="text-2xl font-bold text-purple-600">{evaluationResult.evaluation.writtenAnswerScore}/10</div>
+                          </div>
+                          <div className="p-4 bg-green-50 dark:bg-green-900/20 rounded-lg">
+                            <h4 className="font-semibold text-green-700 dark:text-green-400 mb-2">Technical Rating</h4>
+                            <div className="text-2xl font-bold text-green-600">{evaluationResult.evaluation.technicalRating}/10</div>
+                          </div>
+                        </div>
 
-                    {evaluationResult?.detailedFeedback && (
-                      <div className="mt-6 p-4 bg-blue-50 dark:bg-blue-900/20 rounded-lg">
-                        <h4 className="font-semibold text-blue-700 dark:text-blue-400 mb-2">
-                          Detailed AI Feedback
-                        </h4>
-                        <p className="text-sm text-slate-700 dark:text-slate-300 whitespace-pre-wrap">
-                          {evaluationResult.detailedFeedback}
-                        </p>
-                      </div>
-                    )}
+                        {/* Strengths and Weaknesses */}
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                          <div>
+                            <h4 className="font-semibold text-green-700 dark:text-green-400 mb-2">
+                              Strengths
+                            </h4>
+                            <ul className="space-y-1">
+                              {(evaluationResult.evaluation.strengths || []).map((strength: any, index: number) => (
+                                <li
+                                  key={index}
+                                  className="text-sm text-slate-600 dark:text-slate-400 flex items-start gap-2"
+                                >
+                                  <CheckCircle className="w-4 h-4 text-green-500 mt-0.5 flex-shrink-0" />
+                                  {typeof strength === 'string' ? strength : 
+                                    typeof strength === 'object' && strength !== null ? 
+                                      `${strength.strength || strength.description || 'Strength identified'}` :
+                                      'Strength identified'
+                                  }
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                          <div>
+                            <h4 className="font-semibold text-orange-700 dark:text-orange-400 mb-2">
+                              Areas for Improvement
+                            </h4>
+                            <ul className="space-y-1">
+                              {(evaluationResult.evaluation.weaknesses || []).map((weakness: any, index: number) => (
+                                <li
+                                  key={index}
+                                  className="text-sm text-slate-600 dark:text-slate-400 flex items-start gap-2"
+                                >
+                                  <XCircle className="w-4 h-4 text-orange-500 mt-0.5 flex-shrink-0" />
+                                  {typeof weakness === 'string' ? weakness : 
+                                    typeof weakness === 'object' && weakness !== null ? 
+                                      `${weakness.weakness || weakness.description || 'Area for improvement'}` :
+                                      'Area for improvement'
+                                  }
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        </div>
 
-                    {evaluationResult?.recommendations && (
-                      <div className="mt-4">
-                        <h4 className="font-semibold text-blue-700 dark:text-blue-400 mb-2">
-                          AI Recommendations
-                        </h4>
-                        <ul className="space-y-1">
-                          {evaluationResult.recommendations.map((rec: string, index: number) => (
-                            <li
-                              key={index}
-                              className="text-sm text-slate-600 dark:text-slate-400 flex items-start gap-2"
-                            >
-                              <CheckCircle className="w-4 h-4 text-blue-500 mt-0.5 flex-shrink-0" />
-                              {rec}
-                            </li>
-                          ))}
-                        </ul>
+                        {/* MCQ Analysis */}
+                        {evaluationResult.evaluation?.mcqAnalysis && evaluationResult.evaluation.mcqAnalysis.length > 0 && (
+                          <div className="p-4 bg-blue-50 dark:bg-blue-900/20 rounded-lg">
+                            <h4 className="font-semibold text-blue-700 dark:text-blue-400 mb-3">
+                              📊 MCQ Analysis
+                            </h4>
+                            <div className="space-y-3">
+                              {evaluationResult.evaluation.mcqAnalysis.map((mcq: any, index: number) => (
+                                <div key={index} className="border-l-4 border-blue-200 pl-4 py-2">
+                                  <div className="flex items-start gap-2 mb-1">
+                                    <span className="text-sm font-medium text-blue-600">Q{mcq.questionNumber}:</span>
+                                    <span className="text-sm text-slate-700 dark:text-slate-300 flex-1">{mcq.question}</span>
+                                  </div>
+                                  <div className="flex items-center gap-2 text-sm">
+                                    <span className="text-slate-600 dark:text-slate-400">Your Answer:</span>
+                                    <span className="font-medium">{mcq.userAnswer}</span>
+                                    <span className={`px-2 py-1 rounded text-xs font-medium ${
+                                      mcq.isCorrect 
+                                        ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400' 
+                                        : 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400'
+                                    }`}>
+                                      {mcq.status}
+                                    </span>
+                                  </div>
+                                  {!mcq.isCorrect && (
+                                    <div className="mt-2 text-sm">
+                                      <span className="text-green-600 dark:text-green-400 font-medium">Correct Answer: </span>
+                                      <span className="text-slate-700 dark:text-slate-300">{mcq.correctAnswer}</span>
+                                      {mcq.explanation && (
+                                        <div className="mt-1 text-slate-600 dark:text-slate-400 italic">
+                                          {mcq.explanation}
+                                        </div>
+                                      )}
+                                    </div>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Written Answer Analysis */}
+                        {evaluationResult.evaluation?.writtenAnswerAnalysis && evaluationResult.evaluation.writtenAnswerAnalysis.length > 0 && (
+                          <div className="p-4 bg-purple-50 dark:bg-purple-900/20 rounded-lg">
+                            <h4 className="font-semibold text-purple-700 dark:text-purple-400 mb-3">
+                              📝 Written Answer Analysis
+                            </h4>
+                            <div className="space-y-4">
+                              {evaluationResult.evaluation.writtenAnswerAnalysis.map((analysis: any, index: number) => (
+                                <div key={index} className="border-l-4 border-purple-200 pl-4 py-2">
+                                  <div className="flex items-start gap-2 mb-2">
+                                    <span className="text-sm font-medium text-purple-600">Q{analysis.questionNumber}:</span>
+                                    <span className="text-sm text-slate-700 dark:text-slate-300 flex-1">{analysis.questionText}</span>
+                                    <span className="text-sm font-medium text-purple-600">Score: {analysis.score}/10</span>
+                                  </div>
+                                  
+                                  {analysis.whatIsCorrect && (
+                                    <div className="mb-2">
+                                      <span className="text-green-600 dark:text-green-400 font-medium text-sm">✅ What's Correct: </span>
+                                      <span className="text-slate-700 dark:text-slate-300 text-sm">{analysis.whatIsCorrect}</span>
+                                    </div>
+                                  )}
+                                  
+                                  {analysis.whatIsMissing && (
+                                    <div className="mb-2">
+                                      <span className="text-orange-600 dark:text-orange-400 font-medium text-sm">⚠️ What's Missing: </span>
+                                      <span className="text-slate-700 dark:text-slate-300 text-sm">{analysis.whatIsMissing}</span>
+                                    </div>
+                                  )}
+                                  
+                                  {analysis.modelAnswer && (
+                                    <div className="mb-2">
+                                      <span className="text-blue-600 dark:text-blue-400 font-medium text-sm">📖 Model Answer: </span>
+                                      <div className="text-slate-700 dark:text-slate-300 text-sm bg-slate-100 dark:bg-slate-800 p-2 rounded mt-1">
+                                        {analysis.modelAnswer}
+                                      </div>
+                                    </div>
+                                  )}
+                                  
+                                  {analysis.feedback && (
+                                    <div className="text-sm text-slate-600 dark:text-slate-400 italic">
+                                      💡 {analysis.feedback}
+                                    </div>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Detailed Feedback */}
+                        {evaluationResult.evaluation?.detailedFeedback && (
+                          <div className="p-4 bg-gray-50 dark:bg-gray-900/20 rounded-lg">
+                            <h4 className="font-semibold text-gray-700 dark:text-gray-400 mb-3">
+                              📋 Detailed Analysis
+                            </h4>
+                            {evaluationResult.evaluation?.detailedFeedback?.questionAnalysis && (
+                              <div className="mb-4">
+                                <h5 className="font-medium text-sm text-gray-600 dark:text-gray-400 mb-2">Question Analysis:</h5>
+                                <ul className="space-y-1 text-sm">
+                                  {evaluationResult.evaluation.detailedFeedback.questionAnalysis.map((analysis: any, index: number) => (
+                                    <li key={index} className="text-slate-600 dark:text-slate-400">
+                                      • {typeof analysis === 'string' ? analysis : 
+                                          typeof analysis === 'object' && analysis !== null ? 
+                                            `Question ${index + 1}: ${analysis.question || analysis.analysis || 'Analysis available'}` :
+                                            'Analysis data available'
+                                        }
+                                    </li>
+                                  ))}
+                                </ul>
+                              </div>
+                            )}
+                            {evaluationResult.evaluation?.detailedFeedback?.recommendations && (
+                              <div className="mb-4">
+                                <h5 className="font-medium text-sm text-gray-600 dark:text-gray-400 mb-2">Recommendations:</h5>
+                                <ul className="space-y-1 text-sm">
+                                  {evaluationResult.evaluation.detailedFeedback.recommendations.map((rec: any, index: number) => (
+                                    <li key={index} className="text-slate-600 dark:text-slate-400">
+                                      • {typeof rec === 'string' ? rec : 
+                                          typeof rec === 'object' && rec !== null ? 
+                                            `${rec.title || rec.recommendation || 'Recommendation available'}` :
+                                            'Recommendation available'
+                                        }
+                                    </li>
+                                  ))}
+                                </ul>
+                              </div>
+                            )}
+                            {evaluationResult.evaluation?.detailedFeedback?.nextSteps && (
+                              <div className="mb-4">
+                                <h5 className="font-medium text-sm text-gray-600 dark:text-gray-400 mb-2">Next Steps:</h5>
+                                <ul className="space-y-1 text-sm">
+                                  {evaluationResult.evaluation.detailedFeedback.nextSteps.map((step: any, index: number) => (
+                                    <li key={index} className="text-slate-600 dark:text-slate-400">
+                                      • {typeof step === 'string' ? step : 
+                                          typeof step === 'object' && step !== null ? 
+                                            `${step.step || step.action || 'Next step available'}` :
+                                            'Next step available'
+                                        }
+                                    </li>
+                                  ))}
+                                </ul>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div>
+                          <h4 className="font-semibold text-green-700 dark:text-green-400 mb-2">
+                            Strengths
+                          </h4>
+                          <ul className="space-y-1">
+                            {mockFeedback.strengths.map((strength: string, index: number) => (
+                              <li
+                                key={index}
+                                className="text-sm text-slate-600 dark:text-slate-400 flex items-start gap-2"
+                              >
+                                <CheckCircle className="w-4 h-4 text-green-500 mt-0.5 flex-shrink-0" />
+                                {strength}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                        <div>
+                          <h4 className="font-semibold text-orange-700 dark:text-orange-400 mb-2">
+                            Areas for Improvement
+                          </h4>
+                          <ul className="space-y-1">
+                            {mockFeedback.improvements.map((improvement: string, index: number) => (
+                              <li
+                                key={index}
+                                className="text-sm text-slate-600 dark:text-slate-400 flex items-start gap-2"
+                              >
+                                <XCircle className="w-4 h-4 text-orange-500 mt-0.5 flex-shrink-0" />
+                                {improvement}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
                       </div>
                     )}
 
@@ -1022,106 +1307,145 @@ export default function TechnicalInterviewSimulator() {
               </div>
             ) : (
               /* Interview Screen */
-              <Card className="h-full">
-                <CardHeader>
-                  <div className="flex justify-between items-start">
-                    <div>
-                      <CardTitle className="text-lg">
-                        Question {currentQuestion + 1} of {questions.length}
-                      </CardTitle>
-                      <CardDescription className="flex items-center gap-2 mt-1">
-                        <Badge
-                          variant={
-                            currentQ?.difficulty === "easy"
-                              ? "secondary"
-                              : currentQ?.difficulty === "medium"
-                                ? "default"
-                                : "destructive"
-                          }
-                        >
-                          {currentQ?.difficulty}
-                        </Badge>
-                        <span>•</span>
-                        <span>{currentQ?.category}</span>
-                      </CardDescription>
-                    </div>
-                    <div className="flex items-center gap-3">
-                      {/* Voice Animation and TTS Button */}
-                      <div className="relative flex items-center">
-                        <VoiceAnimation isActive={isSpeaking} size="sm" />
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={toggleSpeech}
-                          className="rounded-full bg-transparent hover:bg-transparent"
-                          title={isSpeaking ? "Stop reading" : `Read question aloud${!isPro ? " (Basic voice)" : ""}`}
-                        >
-                          <span className="sr-only">{isSpeaking ? "Stop reading" : "Read question aloud"}</span>
-                          <Volume2 className="w-5 h-5 text-blue-600" />
-                        </Button>
+              <div className="space-y-4">
+                {/* Interview Details Card */}
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-lg">Interview Details</CardTitle>
+                    <CardDescription>Current session information</CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                      <div className="space-y-1 min-w-0">
+                        <p className="text-sm text-muted-foreground">Tech Stack</p>
+                        <p className="font-medium text-sm break-words overflow-wrap-anywhere">
+                          {techStack || 'Not selected'}
+                        </p>
                       </div>
-
-                      <div className="flex items-center gap-2 text-sm">
-                        <Clock className="w-4 h-4" />
-                        <span className={cn("font-mono", timer <= 10 && "text-red-600")}>
-                          {Math.floor(timer / 60)}:{(timer % 60).toString().padStart(2, "0")}
-                        </span>
+                      <div className="space-y-1 min-w-0">
+                        <p className="text-sm text-muted-foreground">Questions</p>
+                        <p className="font-medium text-sm break-words">
+                          {questions.length} total
+                        </p>
+                      </div>
+                      <div className="space-y-1 min-w-0">
+                        <p className="text-sm text-muted-foreground">Progress</p>
+                        <p className="font-medium text-sm break-words">
+                          {currentQuestion + 1} of {questions.length}
+                        </p>
+                      </div>
+                      <div className="space-y-1 min-w-0">
+                        <p className="text-sm text-muted-foreground">Mode</p>
+                        <p className="font-medium text-sm break-words">
+                          {isPro ? 'Pro' : 'Basic'}
+                        </p>
                       </div>
                     </div>
-                  </div>
-                  <Progress value={progressPercentage} className="mt-4" />
-                </CardHeader>
-                <CardContent className="space-y-6">
-                  <div className="bg-slate-50 dark:bg-slate-800 p-4 rounded-lg">
-                    <p className="text-lg leading-relaxed">{currentQ?.question}</p>
-                  </div>
+                  </CardContent>
+                </Card>
 
-                  {currentQ?.type === "mcq" && currentQ.options && (
-                    <RadioGroup value={currentAnswer} onValueChange={setCurrentAnswer}>
-                      {currentQ.options.map((option, index) => (
-                        <div key={index} className="flex items-center space-x-2">
-                          <RadioGroupItem value={index.toString()} id={`option-${index}`} />
-                          <Label htmlFor={`option-${index}`} className="flex-1 cursor-pointer">
-                            {option}
-                          </Label>
+                {/* Question Card */}
+                <Card className="h-full">
+                  <CardHeader>
+                    <div className="flex justify-between items-start">
+                      <div>
+                        <CardTitle className="text-lg">
+                          Question {currentQuestion + 1} of {questions.length}
+                        </CardTitle>
+                        <CardDescription className="flex items-center gap-2 mt-1">
+                          <Badge
+                            variant={
+                              currentQ?.difficulty === "easy"
+                                ? "secondary"
+                                : currentQ?.difficulty === "medium"
+                                  ? "default"
+                                  : "destructive"
+                            }
+                          >
+                            {currentQ?.difficulty}
+                          </Badge>
+                          <span>•</span>
+                          <span>{currentQ?.category}</span>
+                        </CardDescription>
+                      </div>
+                      <div className="flex items-center gap-3">
+                        {/* Voice Animation and TTS Button */}
+                        <div className="relative flex items-center">
+                          <VoiceAnimation isActive={isSpeaking} size="sm" />
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={toggleSpeech}
+                            className="rounded-full bg-transparent hover:bg-transparent"
+                            title={isSpeaking ? "Stop reading" : `Read question aloud${!isPro ? " (Basic voice)" : ""}`}
+                          >
+                            <span className="sr-only">{isSpeaking ? "Stop reading" : "Read question aloud"}</span>
+                            <Volume2 className="w-5 h-5 text-blue-600" />
+                          </Button>
                         </div>
-                      ))}
-                    </RadioGroup>
-                  )}
 
-                  {currentQ?.type === "short" && (
-                    <Textarea
-                      placeholder="Type your answer here..."
-                      value={currentAnswer}
-                      onChange={(e) => setCurrentAnswer(e.target.value)}
-                      className="min-h-[120px]"
-                    />
-                  )}
+                        <div className="flex items-center gap-2 text-sm">
+                          <Clock className="w-4 h-4" />
+                          <span className={cn("font-mono", timer <= 10 && "text-red-600")}>
+                            {Math.floor(timer / 60)}:{(timer % 60).toString().padStart(2, "0")}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                    <Progress value={progressPercentage} className="mt-4" />
+                  </CardHeader>
+                  <CardContent className="space-y-6">
+                    <div className="bg-slate-50 dark:bg-slate-800 p-4 rounded-lg">
+                      <p className="text-lg leading-relaxed">{currentQ?.question}</p>
+                    </div>
 
-                  {currentQ?.type === "long" && (
-                    <Textarea
-                      placeholder="Provide a detailed explanation..."
-                      value={currentAnswer}
-                      onChange={(e) => setCurrentAnswer(e.target.value)}
-                      className="min-h-[200px]"
-                    />
-                  )}
+                    {currentQ?.type === "mcq" && currentQ.options && (
+                      <RadioGroup value={currentAnswer} onValueChange={setCurrentAnswer}>
+                        {currentQ.options.map((option, index) => (
+                          <div key={index} className="flex items-center space-x-2">
+                            <RadioGroupItem value={index.toString()} id={`option-${index}`} />
+                            <Label htmlFor={`option-${index}`} className="flex-1 cursor-pointer">
+                              {option}
+                            </Label>
+                          </div>
+                        ))}
+                      </RadioGroup>
+                    )}
 
-                  <div className="flex justify-between">
-                    <Button variant="outline" onClick={() => setIsTimerRunning(!isTimerRunning)}>
-                      {isTimerRunning ? <Pause className="w-4 h-4 mr-2" /> : <Play className="w-4 h-4 mr-2" />}
-                      {isTimerRunning ? "Pause" : "Resume"}
-                    </Button>
-                    <Button onClick={handleNextQuestion} disabled={!currentAnswer.trim()}>
-                      {currentQuestion === questions.length - 1 ? "Finish Interview" : "Next Question"}
-                    </Button>
-                  </div>
-                </CardContent>
-              </Card>
+                    {currentQ?.type === "short" && (
+                      <Textarea
+                        placeholder="Type your answer here..."
+                        value={currentAnswer}
+                        onChange={(e) => setCurrentAnswer(e.target.value)}
+                        className="min-h-[120px]"
+                      />
+                    )}
+
+                    {currentQ?.type === "long" && (
+                      <Textarea
+                        placeholder="Provide a detailed explanation..."
+                        value={currentAnswer}
+                        onChange={(e) => setCurrentAnswer(e.target.value)}
+                        className="min-h-[200px]"
+                      />
+                    )}
+
+                    <div className="flex justify-between">
+                      <Button variant="outline" onClick={() => setIsTimerRunning(!isTimerRunning)}>
+                        {isTimerRunning ? <Pause className="w-4 h-4 mr-2" /> : <Play className="w-4 h-4 mr-2" />}
+                        {isTimerRunning ? "Pause" : "Resume"}
+                      </Button>
+                      <Button onClick={handleNextQuestion} disabled={!currentAnswer.trim()}>
+                        {currentQuestion === questions.length - 1 ? "Finish Interview" : "Next Question"}
+                      </Button>
+                    </div>
+                  </CardContent>
+                </Card>
+              </div>
             )}
           </div>
         </div>
       </div>
     </div>
-  )
+  );
 }
